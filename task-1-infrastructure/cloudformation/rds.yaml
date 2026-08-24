@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NimbusTech RDS PostgreSQL - Multi-AZ, encrypted, private'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nimbustech
+
+  DBName:
+    Type: String
+    Default: nimbustechdb
+    Description: Database name
+
+  DBUsername:
+    Type: String
+    Default: nimbusadmin
+    NoEcho: true
+    Description: Master username for RDS
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Master password for RDS (min 8 characters)
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+    Description: RDS instance class
+
+  MultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable Multi-AZ deployment
+
+  PrivateDBSubnet1:
+    Type: String
+    Description: Private DB Subnet 1 ID
+
+  PrivateDBSubnet2:
+    Type: String
+    Description: Private DB Subnet 2 ID
+
+  RDSSecurityGroup:
+    Type: String
+    Description: RDS Security Group ID
+
+Resources:
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub ${ProjectName}-db-subnet-group
+      DBSubnetGroupDescription: Subnet group for RDS in private subnets
+      SubnetIds:
+        - !Ref PrivateDBSubnet1
+        - !Ref PrivateDBSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-db-subnet-group
+
+  # DB Parameter Group
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub ${ProjectName}-postgres16-params
+      Description: Parameter group for PostgreSQL 16
+      Family: postgres16
+      Parameters:
+        log_connections: '1'
+        log_disconnections: '1'
+        log_duration: '1'
+        log_statement: 'ddl'
+        shared_preload_libraries: 'pg_stat_statements'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-postgres16-params
+
+  # Enhanced Monitoring Role
+  MonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-rds-monitoring-role
+
+  # RDS PostgreSQL Instance
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-db
+      Engine: postgres
+      EngineVersion: '16.3'
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: '100'
+      MaxAllocatedStorage: 500  # Enable storage autoscaling
+      StorageType: gp3
+      StorageEncrypted: true
+
+      # Database configuration
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      Port: 5432
+
+      # Network configuration
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      PubliclyAccessible: false  # CRITICAL: Never expose RDS to internet
+
+      # High availability
+      MultiAZ: !Ref MultiAZ
+
+      # Backup configuration
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'mon:04:00-mon:05:00'
+      CopyTagsToSnapshot: true
+
+      # Monitoring
+      EnableCloudwatchLogsExports:
+        - postgresql
+        - upgrade
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7  # Free tier
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt MonitoringRole.Arn
+
+      # Parameter and option groups
+      DBParameterGroupName: !Ref DBParameterGroup
+
+      # Deletion protection
+      DeletionProtection: false  # Set to true in production
+
+      # Auto minor version upgrades
+      AutoMinorVersionUpgrade: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-db
+
+Outputs:
+  DBInstanceId:
+    Description: RDS Instance ID
+    Value: !Ref DBInstance
+    Export:
+      Name: !Sub ${ProjectName}-DBInstanceId
+
+  DBEndpoint:
+    Description: RDS Endpoint Address
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-DBEndpoint
+
+  DBPort:
+    Description: RDS Port
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub ${ProjectName}-DBPort

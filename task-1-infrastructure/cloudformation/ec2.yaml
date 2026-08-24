@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NimbusTech EC2 Instances - SSM access, CloudWatch monitoring, IMDSv2'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nimbustech
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: EC2 instance type
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: Ubuntu 22.04 LTS AMI ID (auto-updated via SSM)
+
+  PrivateAppSubnet1:
+    Type: String
+    Description: Private App Subnet 1 ID
+
+  PrivateAppSubnet2:
+    Type: String
+    Description: Private App Subnet 2 ID
+
+  AppSecurityGroup:
+    Type: String
+    Description: Application Security Group ID
+
+  TargetGroupArn:
+    Type: String
+    Description: ALB Target Group ARN
+
+  DBEndpoint:
+    Type: String
+    Description: RDS Endpoint Address
+
+  DBPort:
+    Type: String
+    Description: RDS Port
+
+  DBName:
+    Type: String
+    Default: nimbustechdb
+    Description: Database name
+
+Resources:
+  # IAM Role for EC2
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # SSM access (no SSH needed)
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # CloudWatch agent
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        # Read RDS credentials from Secrets Manager
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/rds/*
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-ec2-role
+
+  # Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${ProjectName}-ec2-profile
+      Roles:
+        - !Ref EC2Role
+
+  # CloudWatch Log Group
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/ec2/${ProjectName}/application
+      RetentionInDays: 30
+
+  # Launch Template (for future Auto Scaling)
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ProjectName}-app-lt
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        # IMDSv2 Enforcement - Prevents SSRF attacks
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required  # IMDSv2 only
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: enabled
+        Monitoring:
+          Enabled: true  # Detailed CloudWatch monitoring
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 20
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+
+            # Bootstrap script for NimbusTech application servers
+            PROJECT_NAME="${ProjectName}"
+            DB_HOST="${DBEndpoint}"
+            DB_PORT="${DBPort}"
+            DB_NAME="${DBName}"
+            REGION="${AWS::Region}"
+
+            # Update system packages
+            apt-get update -y
+            apt-get upgrade -y
+
+            # Install Node.js 18 LTS
+            curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+            apt-get install -y nodejs
+
+            # Install CloudWatch Agent
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+            dpkg -i -E ./amazon-cloudwatch-agent.deb
+            rm amazon-cloudwatch-agent.deb
+
+            # Configure CloudWatch Agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<EOF
+            {
+              "metrics": {
+                "namespace": "$PROJECT_NAME",
+                "metrics_collected": {
+                  "mem": {
+                    "measurement": [
+                      {"name": "mem_used_percent", "rename": "MemoryUtilization", "unit": "Percent"}
+                    ],
+                    "metrics_collection_interval": 60
+                  },
+                  "disk": {
+                    "measurement": [
+                      {"name": "used_percent", "rename": "DiskUtilization", "unit": "Percent"}
+                    ],
+                    "metrics_collection_interval": 60,
+                    "resources": ["*"]
+                  }
+                }
+              },
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/app/application.log",
+                        "log_group_name": "/aws/ec2/$PROJECT_NAME/application",
+                        "log_stream_name": "{instance_id}"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            EOF
+
+            # Start CloudWatch Agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config \
+              -m ec2 \
+              -s \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+
+            # Create application directory
+            mkdir -p /opt/app
+            mkdir -p /var/log/app
+            chown -R ubuntu:ubuntu /opt/app /var/log/app
+
+            # Create environment file
+            cat > /opt/app/.env <<EOF
+            NODE_ENV=production
+            PORT=3000
+            DB_HOST=$DB_HOST
+            DB_PORT=$DB_PORT
+            DB_NAME=$DB_NAME
+            EOF
+
+            # Create systemd service for Node.js app
+            cat > /etc/systemd/system/nimbustech-api.service <<EOF
+            [Unit]
+            Description=NimbusTech Node.js API
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=ubuntu
+            WorkingDirectory=/opt/app
+            EnvironmentFile=/opt/app/.env
+            ExecStart=/usr/bin/node /opt/app/index.js
+            Restart=always
+            RestartSec=10
+            StandardOutput=append:/var/log/app/application.log
+            StandardError=append:/var/log/app/application.log
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+
+            echo "Bootstrap complete"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectName}-app
+              - Key: Role
+                Value: Application
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectName}-app-volume
+
+  # EC2 Instance 1
+  EC2Instance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateAppSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-app-1
+
+  # EC2 Instance 2
+  EC2Instance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateAppSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-app-2
+
+  # Register instances with ALB Target Group
+  TargetGroupAttachment1:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroupAttachment
+    Properties:
+      TargetGroupArn: !Ref TargetGroupArn
+      TargetId: !Ref EC2Instance1
+      Port: 3000
+
+  TargetGroupAttachment2:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroupAttachment
+    Properties:
+      TargetGroupArn: !Ref TargetGroupArn
+      TargetId: !Ref EC2Instance2
+      Port: 3000
+
+Outputs:
+  Instance1Id:
+    Description: EC2 Instance 1 ID
+    Value: !Ref EC2Instance1
+
+  Instance2Id:
+    Description: EC2 Instance 2 ID
+    Value: !Ref EC2Instance2
+
+  Instance1PrivateIP:
+    Description: EC2 Instance 1 Private IP
+    Value: !GetAtt EC2Instance1.PrivateIp
+
+  Instance2PrivateIP:
+    Description: EC2 Instance 2 Private IP
+    Value: !GetAtt EC2Instance2.PrivateIp
+
+  SSMConnectCommand:
+    Description: Command to connect via SSM
+    Value: !Sub aws ssm start-session --target ${EC2Instance1} --region ${AWS::Region}

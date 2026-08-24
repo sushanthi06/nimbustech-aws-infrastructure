@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NimbusTech Security Groups - Least privilege network access'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nimbustech
+
+  VPCId:
+    Type: String
+    Description: VPC ID (from vpc stack)
+
+Resources:
+  # ALB Security Group
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-alb-sg
+      GroupDescription: Security group for Application Load Balancer - allows HTTP/HTTPS from internet
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        # HTTP from internet
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from internet (redirect to HTTPS in production)
+        # HTTPS from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS from internet
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-alb-sg
+
+  # ALB Egress to App Tier
+  ALBEgressToApp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      DestinationSecurityGroupId: !Ref AppSecurityGroup
+      Description: Allow outbound to application tier on port 3000
+
+  # Application Security Group
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-app-sg
+      GroupDescription: Security group for application servers - accepts traffic from ALB only
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        # From ALB only
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow traffic from ALB on application port 3000
+      # NO SSH INGRESS - use AWS Systems Manager Session Manager instead
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-app-sg
+
+  # App Egress to RDS
+  AppEgressToRDS:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref RDSSecurityGroup
+      Description: Allow outbound to RDS PostgreSQL
+
+  # App Egress HTTPS (for updates, AWS APIs)
+  AppEgressHTTPS:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Allow HTTPS to internet for updates and external APIs
+
+  # App Egress HTTP (for package managers)
+  AppEgressHTTP:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+      Description: Allow HTTP to internet for package managers
+
+  # RDS Security Group
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-rds-sg
+      GroupDescription: Security group for RDS PostgreSQL - accepts traffic from app tier only
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        # PostgreSQL from App tier only
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: Allow PostgreSQL from application tier only
+      # NO egress rules - databases should not initiate outbound connections
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-rds-sg
+
+Outputs:
+  ALBSecurityGroupId:
+    Description: ALB Security Group ID
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-ALBSecurityGroup
+
+  AppSecurityGroupId:
+    Description: Application Security Group ID
+    Value: !Ref AppSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-AppSecurityGroup
+
+  RDSSecurityGroupId:
+    Description: RDS Security Group ID
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-RDSSecurityGroup
