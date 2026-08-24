@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Fix - IAM Least Privilege for Deploy User (Finding 4)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nimbustech
+    Description: Project name for resource naming
+
+  ArtifactsBucketName:
+    Type: String
+    Default: nimbustech-artifacts
+    Description: S3 bucket name for deployment artifacts
+
+Resources:
+  # Deploy user
+  DeployUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: deploy-user
+      Path: /service-accounts/
+      Tags:
+        - Key: Name
+          Value: NimbusTech Deploy User
+        - Key: Purpose
+          Value: CI/CD Pipeline
+        - Key: Remediation
+          Value: Finding-4-IAM-Least-Privilege
+
+  # Least-privilege policy
+  DeployUserPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: NimbusTechDeployPolicy
+      Description: Least-privilege policy for CI/CD deployments - replaces AdministratorAccess
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # S3: Upload artifacts
+          - Sid: S3ArtifactUpload
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${ArtifactsBucketName}/*'
+
+          - Sid: S3ListBucket
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !Sub 'arn:aws:s3:::${ArtifactsBucketName}'
+
+          # EC2: Describe only
+          - Sid: EC2DescribeOnly
+            Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeTags
+              - ec2:DescribeInstanceStatus
+            Resource: '*'
+
+          # CodeDeploy
+          - Sid: CodeDeployDeployments
+            Effect: Allow
+            Action:
+              - codedeploy:CreateDeployment
+              - codedeploy:GetDeployment
+              - codedeploy:GetDeploymentConfig
+              - codedeploy:GetApplicationRevision
+              - codedeploy:RegisterApplicationRevision
+            Resource:
+              - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ProjectName}-app/*'
+              - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ProjectName}-app'
+
+          # Auto Scaling
+          - Sid: AutoScalingDuringDeploy
+            Effect: Allow
+            Action:
+              - autoscaling:SuspendProcesses
+              - autoscaling:ResumeProcesses
+              - autoscaling:DescribeAutoScalingGroups
+            Resource: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${ProjectName}-app-asg'
+
+          # ELB
+          - Sid: ELBTargetGroupManagement
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:DescribeTargetGroups
+              - elasticloadbalancing:DescribeTargetHealth
+              - elasticloadbalancing:RegisterTargets
+              - elasticloadbalancing:DeregisterTargets
+            Resource: !Sub 'arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/${ProjectName}-app-tg/*'
+
+          # CloudWatch
+          - Sid: CloudWatchMetrics
+            Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'cloudwatch:namespace': NimbusTech/Deployments
+
+  # Attach policy to user
+  DeployUserPolicyAttachment:
+    Type: AWS::IAM::UserPolicyAttachment
+    Properties:
+      UserName: !Ref DeployUser
+      PolicyArn: !Ref DeployUserPolicy
+
+  # MFA enforcement policy
+  DeployUserMFAPolicy:
+    Type: AWS::IAM::UserPolicy
+    Properties:
+      PolicyName: RequireMFA
+      UserName: !Ref DeployUser
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyAllExceptListedIfNoMFA
+            Effect: Deny
+            NotAction:
+              - iam:CreateVirtualMFADevice
+              - iam:EnableMFADevice
+              - iam:GetUser
+              - iam:ListMFADevices
+              - iam:ListVirtualMFADevices
+              - iam:ResyncMFADevice
+              - sts:GetSessionToken
+            Resource: '*'
+            Condition:
+              BoolIfExists:
+                'aws:MultiFactorAuthPresent': false
+
+  # Alternative: GitHub Actions OIDC role
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GitHubActionsDeployRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                'token.actions.githubusercontent.com:sub': 'repo:nimbustech/app:*'
+      ManagedPolicyArns:
+        - !Ref DeployUserPolicy
+      Tags:
+        - Key: Name
+          Value: GitHub Actions Deploy Role
+
+Outputs:
+  DeployUserName:
+    Description: Deploy user name
+    Value: !Ref DeployUser
+    Export:
+      Name: !Sub '${AWS::StackName}-DeployUser'
+
+  DeployPolicyArn:
+    Description: ARN of the least-privilege deploy policy
+    Value: !Ref DeployUserPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-DeployPolicy'
+
+  GitHubActionsRoleArn:
+    Description: ARN of GitHub Actions OIDC role
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GitHubActionsRole'

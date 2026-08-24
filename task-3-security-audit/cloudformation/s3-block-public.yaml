@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Fix - Block S3 Public Access (Finding 3)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nimbustech
+    Description: Project name for resource naming
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for bucket policy restriction
+
+  EC2RoleArn:
+    Type: String
+    Description: ARN of EC2 IAM role for bucket access
+
+Resources:
+  # Main uploads bucket
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: nimbus-uploads
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref UploadsLogsBucket
+        LogFilePrefix: uploads-access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+          - Id: intelligent-tiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-uploads'
+        - Key: Remediation
+          Value: Finding-3-S3-Block-Public
+
+  # CRITICAL FIX: Block all public access
+  UploadsPublicAccessBlock:
+    Type: AWS::S3::BucketPublicAccessBlock
+    Properties:
+      Bucket: !Ref UploadsBucket
+      BlockPublicAcls: true
+      BlockPublicPolicy: true
+      IgnorePublicAcls: true
+      RestrictPublicBuckets: true
+
+  # Bucket policy - VPC and IAM role access only
+  UploadsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UploadsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonVPCAccess
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt UploadsBucket.Arn
+              - !Sub '${UploadsBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                'aws:SourceVpc': !Ref VPCId
+          - Sid: AllowApplicationRole
+            Effect: Allow
+            Principal:
+              AWS: !Ref EC2RoleArn
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+            Resource: !Sub '${UploadsBucket.Arn}/*'
+
+  # Logs bucket
+  UploadsLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: nimbus-uploads-logs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-uploads-logs'
+
+  # Block public access on logs bucket
+  UploadsLogsPublicAccessBlock:
+    Type: AWS::S3::BucketPublicAccessBlock
+    Properties:
+      Bucket: !Ref UploadsLogsBucket
+      BlockPublicAcls: true
+      BlockPublicPolicy: true
+      IgnorePublicAcls: true
+      RestrictPublicBuckets: true
+
+Outputs:
+  UploadsBucketName:
+    Description: Name of the uploads bucket
+    Value: !Ref UploadsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-UploadsBucket'
+
+  UploadsBucketArn:
+    Description: ARN of the uploads bucket
+    Value: !GetAtt UploadsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UploadsBucketArn'
+
+  LogsBucketName:
+    Description: Name of the logs bucket
+    Value: !Ref UploadsLogsBucket

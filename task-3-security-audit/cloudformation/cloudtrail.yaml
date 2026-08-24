@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Fix - Enable CloudTrail with Multi-Region Support (Finding 5)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nimbustech
+    Description: Project name for resource naming
+
+Resources:
+  # S3 bucket for CloudTrail logs
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudtrail-logs-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: cloudtrail-log-retention
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            ExpirationInDays: 730
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudtrail-logs'
+        - Key: Remediation
+          Value: Finding-5-CloudTrail
+
+  # Block public access
+  CloudTrailLogsPublicAccessBlock:
+    Type: AWS::S3::BucketPublicAccessBlock
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      BlockPublicAcls: true
+      BlockPublicPolicy: true
+      IgnorePublicAcls: true
+      RestrictPublicBuckets: true
+
+  # Bucket policy for CloudTrail
+  CloudTrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # CloudWatch Log Group
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/${ProjectName}'
+      RetentionInDays: 90
+
+  # IAM role for CloudTrail to CloudWatch Logs
+  CloudTrailCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-cloudtrail-cloudwatch-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-cloudtrail-cloudwatch-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AWSCloudTrailCreateLogStream
+                Effect: Allow
+                Action: logs:CreateLogStream
+                Resource: !Sub '${CloudTrailLogGroup.Arn}:*'
+              - Sid: AWSCloudTrailPutLogEvents
+                Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !Sub '${CloudTrailLogGroup.Arn}:*'
+
+  # CloudTrail
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - CloudTrailLogsBucketPolicy
+    Properties:
+      TrailName: !Sub '${ProjectName}-trail'
+      S3BucketName: !Ref CloudTrailLogsBucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailCloudWatchRole.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+      IsLogging: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudtrail'
+        - Key: Remediation
+          Value: Finding-5-CloudTrail
+
+  # Metric filter - Unauthorized API calls
+  UnauthorizedAPICallsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
+      MetricTransformations:
+        - MetricName: UnauthorizedAPICalls
+          MetricNamespace: CloudTrail/SecurityMetrics
+          MetricValue: '1'
+
+  UnauthorizedAPICallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-unauthorized-api-calls'
+      AlarmDescription: Alert when multiple unauthorized API calls are detected
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      MetricName: UnauthorizedAPICalls
+      Namespace: CloudTrail/SecurityMetrics
+      Period: 300
+      Statistic: Sum
+      Threshold: 10
+
+  # Metric filter - Root account usage
+  RootAccountUsageFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: '{ $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS && $.eventType != "AwsServiceEvent" }'
+      MetricTransformations:
+        - MetricName: RootAccountUsage
+          MetricNamespace: CloudTrail/SecurityMetrics
+          MetricValue: '1'
+
+  RootAccountUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-root-account-usage'
+      AlarmDescription: Alert when root account is used
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      MetricName: RootAccountUsage
+      Namespace: CloudTrail/SecurityMetrics
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+  # Metric filter - IAM policy changes
+  IAMPolicyChangesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: '{($.eventName=DeleteGroupPolicy)||($.eventName=DeleteRolePolicy)||($.eventName=DeleteUserPolicy)||($.eventName=PutGroupPolicy)||($.eventName=PutRolePolicy)||($.eventName=PutUserPolicy)||($.eventName=CreatePolicy)||($.eventName=DeletePolicy)||($.eventName=CreatePolicyVersion)||($.eventName=DeletePolicyVersion)||($.eventName=AttachRolePolicy)||($.eventName=DetachRolePolicy)||($.eventName=AttachUserPolicy)||($.eventName=DetachUserPolicy)||($.eventName=AttachGroupPolicy)||($.eventName=DetachGroupPolicy)}'
+      MetricTransformations:
+        - MetricName: IAMPolicyChanges
+          MetricNamespace: CloudTrail/SecurityMetrics
+          MetricValue: '1'
+
+Outputs:
+  CloudTrailName:
+    Description: Name of the CloudTrail
+    Value: !Ref CloudTrail
+    Export:
+      Name: !Sub '${AWS::StackName}-TrailName'
+
+  CloudTrailBucketName:
+    Description: S3 bucket for CloudTrail logs
+    Value: !Ref CloudTrailLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LogsBucket'
+
+  CloudTrailLogGroupName:
+    Description: CloudWatch Log Group for CloudTrail
+    Value: !Ref CloudTrailLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'

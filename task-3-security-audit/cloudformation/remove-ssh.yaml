@@ -1,0 +1,60 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Fix - Remove SSH Access and Use SSM Session Manager (Finding 2)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nimbustech
+    Description: Project name for resource naming
+
+  EC2RoleName:
+    Type: String
+    Description: Name of the EC2 IAM role to attach SSM policy
+
+Resources:
+  # CloudWatch Log Group for SSM sessions
+  SSMSessionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/ssm/sessions
+      RetentionInDays: 90
+
+  # IAM Policy Attachment for SSM
+  EC2SSMPolicyAttachment:
+    Type: AWS::IAM::RolePolicyAttachment
+    Properties:
+      RoleName: !Ref EC2RoleName
+      PolicyArn: arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  # SSM Document for Session Manager preferences
+  SessionManagerPreferences:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: SSM-SessionManagerRunShell
+      DocumentType: Session
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: '1.0'
+        description: Document to hold session preferences for NimbusTech
+        sessionType: Standard_Stream
+        inputs:
+          s3BucketName: ''
+          s3KeyPrefix: ''
+          s3EncryptionEnabled: true
+          cloudWatchLogGroupName: /aws/ssm/sessions
+          cloudWatchEncryptionEnabled: true
+          idleSessionTimeout: '15'
+          maxSessionDuration: '60'
+          runAsEnabled: false
+          runAsDefaultUser: ''
+
+Outputs:
+  SSMSessionsLogGroup:
+    Description: CloudWatch Log Group for SSM sessions
+    Value: !Ref SSMSessionsLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  Instructions:
+    Description: How to connect using SSM
+    Value: 'aws ssm start-session --target <instance-id> --region us-east-1'

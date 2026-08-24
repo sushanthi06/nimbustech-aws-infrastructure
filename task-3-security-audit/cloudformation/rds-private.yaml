@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Fix - Make RDS Instance Private (Finding 1)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nimbustech
+    Description: Project name for resource naming
+
+  DBUsername:
+    Type: String
+    NoEcho: true
+    Description: Database master username
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Database master password
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for RDS instance
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs for RDS subnet group
+
+  RDSSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group ID for RDS instance
+
+Resources:
+  # DB Subnet Group for private subnets
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnet-group'
+      DBSubnetGroupDescription: Private subnets for RDS instance
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group'
+
+  # RDS Instance - Private (publicly_accessible = false)
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-db'
+      Engine: postgres
+      EngineVersion: '16.3'
+      DBInstanceClass: db.t3.medium
+      AllocatedStorage: 100
+      StorageEncrypted: true
+
+      # CRITICAL FIX: Make database private
+      PubliclyAccessible: false
+
+      DBName: nimbustechdb
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+
+      # Network configuration
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroupId
+
+      # High availability
+      MultiAZ: true
+
+      # Backup configuration
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'mon:04:00-mon:05:00'
+
+      # Protection
+      DeletionProtection: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db'
+        - Key: Remediation
+          Value: Finding-1-RDS-Private
+
+Outputs:
+  DBInstanceEndpoint:
+    Description: RDS instance endpoint address
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DBEndpoint'
+
+  DBInstancePort:
+    Description: RDS instance port
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DBPort'
+
+  PubliclyAccessible:
+    Description: RDS publicly accessible status (should be false)
+    Value: false
